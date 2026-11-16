@@ -1,757 +1,567 @@
 """
 experiments/run_crc_fs_experiment.py
 
-Comprehensive ACDC Benchmark for Conformal Risk Control on Clinical Metrics
-(aligned with Topic1_Conformal_Risk_Control.md):
-  1. Empirical Coverage vs. 90% target
-  2. Interval Width / Efficiency (vs. Split CP, CRC ICLR 2024, COMPASS ICLR 2026)
-  3. Group-Conditional Coverage & Coverage Gap across ACDC pathologies (DCM, HCM, MINF, NOR, RV)
-  4. Correlation between Interval Width and Case Difficulty / Error
+Đánh giá TOÀN BỘ 8 phương pháp Conformal Prediction trên ACDC:
+  1. SCP        - Split Conformal Prediction (Baseline)
+  2. CRC        - Conformal Risk Control (Theorem 2.1)
+  3. ASCP       - Adaptive Split CP (Normalized scores)
+  4. ACRC       - Adaptive CRC (Normalized + Binary search)
+  5. COMPASS-L  - Feature Perturbation (Uniform logit shift)
+  6. COMPASS-J  - Feature Perturbation (Jacobian PCA subspace) [FIXED]
+  7. CRC-FS-L   - [NEW] CRC + COMPASS + Adaptive (Logit shift)
+  8. CRC-FS-J   - [NEW] CRC + COMPASS + Adaptive (Jacobian PCA)
+
+Mục tiêu: Coverage >= 90% + Width NHỎ NHẤT.
 """
 
-import argparse
 import sys
-from pathlib import Path
-from time import time
-
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import nibabel as nib
+import os
 import numpy as np
 import pandas as pd
+import nibabel as nib
 import torch
-from scipy.stats import wilcoxon
+from pathlib import Path
+from tqdm import tqdm
 from sklearn.model_selection import KFold
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from time import time
 
-WORKSPACE_DIR = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(WORKSPACE_DIR))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from src.conformal.split_conformal import calibrate, predict_interval, evaluate_coverage
+from src.conformal.crc import find_lambda
 from src.conformal.adaptive_scores import (
-    calibrate_normalized,
     compute_uncertainty_from_probs,
+    calibrate_normalized,
     predict_interval_normalized,
+    find_lambda_adaptive,
 )
 from src.conformal.compass import (
-    calibrate_compass,
     compass_l_score,
+    calibrate_compass,
     predict_interval_compass,
 )
 from src.conformal.compass_j import (
-    calibrate_compass_j,
+    compute_volume_jacobian,
     compass_j_score,
-    compute_hidden_feature_subspace,
-    compute_multiclass_logit_jacobian,
-    compute_shared_directions,
-    hidden_feature_direction_for_sample,
+    calibrate_compass_j,
     predict_interval_compass_j,
+    compute_shared_directions,
+    project_jacobian_to_subspace,
 )
-from src.conformal.crc import find_lambda
 from src.conformal.crc_fs import (
-    bounded_severity_risk,
-    calibrate_and_predict_crc_fs,
-    calibrate_and_predict_ef_crc_fs,
     calibrate_crc_fs_l_from_scores,
-    extract_directional_features,
-    extract_ef_directional_features,
     predict_interval_crc_fs_l,
-)
-from src.conformal.split_conformal import (
-    calibrate,
-    conformal_quantile,
-    predict_interval,
+    calibrate_crc_fs_j,
+    predict_interval_crc_fs_j,
 )
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-ORGAN_CLASSES = {"LV": 3, "RV": 1, "MYO": 2}
+#  Config 
+WORKSPACE_DIR = Path("D:/Hoc_Tap/DATN")
+DATA_DIR      = WORKSPACE_DIR / "data_ACDC/training"
+PRED_DIR      = WORKSPACE_DIR / "nnunet_output"
+RESULTS_DIR   = WORKSPACE_DIR / "results"
+FIG_DIR       = RESULTS_DIR / "figures"
+ALPHA         = 0.1       # Target: 90% coverage
+TARGET_CLASS  = 3         # Left Ventricle in ACDC
+N_FOLDS       = 5
+N_PCA         = 5         # PCA components for subspace methods
+DEVICE        = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+print(f"Using device: {DEVICE}")
+print(f"Target coverage: {(1-ALPHA)*100:.0f}%")
 
 
-def load_head_weight(model: str = "3d_fullres") -> np.ndarray | None:
-    """Load averaged final 1x1 segmentation head weight W (C, D_h) from nnU-Net folds."""
-    base = (
-        WORKSPACE_DIR
-        / "nnunet_data/RESULTS_FOLDER/nnUNet"
-        / model
-        / "Task027_ACDC/nnUNetTrainerV2__nnUNetPlansv2.1"
-    )
-    weights = []
-    for f_idx in range(5):
-        ckpt_p = base / f"fold_{f_idx}/model_final_checkpoint.model"
-        if not ckpt_p.exists():
-            continue
-        ckpt = torch.load(str(ckpt_p), map_location="cpu", weights_only=False)
-        sd = ckpt["state_dict"]
-        seg_keys = sorted(
-            [k for k in sd if k.startswith("seg_outputs.") and k.endswith(".weight")],
-            key=lambda k: int(k.split(".")[1]),
-        )
-        if seg_keys:
-            w = sd[seg_keys[-1]].squeeze().numpy()
-            if w.ndim == 2:
-                weights.append(w)
-    if not weights:
-        return None
-    return np.mean(weights, axis=0)
+#  1. Load data 
 
-
-def parse_info_cfg(cfg_path: Path) -> dict:
-    info = {}
-    if cfg_path.exists():
-        with open(cfg_path, "r") as f:
-            for line in f:
-                if ":" in line:
-                    k, v = line.split(":", 1)
-                    info[k.strip()] = v.strip()
-    return info
-
-
-def load_samples(data_dir: Path, pred_dir: Path, target_class: int, head_weight: np.ndarray | None = None) -> list:
-    """Load softmax .npz + GT .nii.gz pairs and compute directional feature proxies."""
-    npz_files = sorted(pred_dir.glob("*.npz"))
+def load_all_samples():
+    """Load all .npz + .nii.gz GT pairs."""
+    npz_files = sorted(PRED_DIR.glob("*.npz"))
     if not npz_files:
-        raise FileNotFoundError(f"No .npz files found in {pred_dir}")
+        print("ERROR: No .npz files found. Run run_nnunet_inference.py --save_npz first.")
+        sys.exit(1)
 
+    print(f"Found {len(npz_files)} .npz files.")
     samples = []
-    for npz_path in npz_files:
-        parts = npz_path.stem.split("_")
+
+    for npz_path in tqdm(npz_files, desc="Loading samples"):
+        stem = npz_path.stem
+        parts = stem.split("_")
         if len(parts) < 2:
             continue
-        pid, fid = parts[0], parts[1]
-        gt_path = data_dir / pid / f"{pid}_{fid}_gt.nii.gz"
+        patient_id = parts[0]
+        frame_id   = parts[1]
+        gt_path    = DATA_DIR / patient_id / f"{patient_id}_{frame_id}_gt.nii.gz"
+
         if not gt_path.exists():
             continue
 
-        info = parse_info_cfg(data_dir / pid / "Info.cfg")
-        group = info.get("Group", "UNK")
-        ed_frame = f"frame{int(info.get('ED', 1)):02d}"
-        es_frame = f"frame{int(info.get('ES', 1)):02d}"
+        data  = np.load(str(npz_path))
+        probs = data['softmax'].astype(np.float32)
 
-        probs = np.load(str(npz_path))["softmax"].astype(np.float32)
-        gt_img = nib.load(str(gt_path))
-        gt_mask = gt_img.get_fdata()
-        sp = gt_img.header.get_zooms()
-        voxel_vol = float(sp[0] * sp[1] * sp[2]) / 1000.0
-        y_true = float(np.sum(gt_mask == target_class)) * voxel_vol
+        gt_img   = nib.load(str(gt_path))
+        gt_mask  = gt_img.get_fdata()
+        spacing  = gt_img.header.get_zooms()
+        voxel_vol = float(spacing[0] * spacing[1] * spacing[2]) / 1000.0
 
-        feats = extract_directional_features(
-            probs, target_class, voxel_vol, dz=float(sp[2]), head_weight=head_weight
-        )
-        ent = compute_uncertainty_from_probs(probs, target_class, method="entropy")
-        sigma_jac = 1.0 / max(feats["sens"], 1e-8)
+        gt_binary = (gt_mask == TARGET_CLASS).astype(np.uint8)
+        y_true    = float(np.sum(gt_binary)) * voxel_vol
 
-        probs_t = torch.tensor(probs, dtype=torch.float32, device=DEVICE)
-        mfn = lambda m, v=voxel_vol: float(m.sum().item()) * v
-        sc_l = compass_l_score(probs_t, y_true, target_class, mfn, b_max=15.0, n_iter=14)
+        # Soft volume prediction (same metric as COMPASS)
+        probs_tensor = torch.tensor(probs, dtype=torch.float32, device=DEVICE)
+        y_pred_soft = float(probs_tensor[TARGET_CLASS].sum().item()) * voxel_vol
 
-        J_z = compute_multiclass_logit_jacobian(probs_t, target_class, voxel_vol)
-        dir_j = J_z / max(float(J_z.abs().max().item()), 1e-8)
+        sigma = compute_uncertainty_from_probs(probs, TARGET_CLASS, method='entropy')
+        p_t = np.clip(probs[TARGET_CLASS], 1e-7, 1-1e-7)
+        sensitivity = float(np.sum(p_t * (1.0 - p_t)) * voxel_vol)
+        sigma_jac = 1.0 / max(sensitivity, 1e-8)
+
+        def make_metric_fn(vvol):
+            def metric_fn(binary_mask):
+                if isinstance(binary_mask, torch.Tensor):
+                    return float(binary_mask.sum().item()) * vvol
+                return float(np.sum(binary_mask)) * vvol
+            return metric_fn
 
         samples.append({
-            "patient_id": pid,
-            "frame": fid,
-            "group": group,
-            "is_ed": int(fid == ed_frame),
-            "ed_frame": ed_frame,
-            "es_frame": es_frame,
-            "y_true": y_true,
-            "probs": probs_t,
-            "voxel_vol": voxel_vol,
-            "metric_fn": mfn,
-            "entropy": ent,
-            "sigma_jac": sigma_jac,
-            "sc_l": sc_l,
-            "dir_j": dir_j,
-            **feats,
+            'patient_id' : patient_id,
+            'frame'      : frame_id,
+            'y_true'     : y_true,
+            'y_pred'     : y_pred_soft,  # ← SOFT volume prediction
+            'sigma'      : sigma,         # entropy (for ASCP/ACRC baselines)
+            'sigma_jac'  : sigma_jac,     # 1/sensitivity (for CRC-FS, model-aware)
+            'probs'      : probs_tensor,
+            'voxel_vol'  : voxel_vol,
+            'metric_fn'  : make_metric_fn(voxel_vol),
         })
+
+    print(f"Loaded {len(samples)} valid samples.")
     return samples
 
 
-def evaluate_organ_kfold(
-    samples: list,
-    target_class: int,
-    organ_name: str,
-    split_name: str,
-    head_weight: np.ndarray | None,
-    alpha: float = 0.1,
-    n_folds: int = 5,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Run patient-level 5-fold CV comparing all baselines and DA-CRC-FS."""
-    pids = sorted({s["patient_id"] for s in samples})
-    kf = KFold(n_splits=n_folds, shuffle=True, random_state=42)
+#  2. Cross-Validation 
 
-    methods = [
-        "scp_soft",
-        "scp_hard",
-        "crc",
-        "ascp_ent",
-        "ascp_sens",
-        "compass_l",
-        "compass_j",
-        "compass_j_32ch",
-        "crc_fs_legacy",
-        "dacrc_oof",
-        "dacrc_cv_plus",
-        "dacrc_manifold",
-        "dacrc_mondrian",
-        "dacrc_risk_crc",
-    ]
-    if head_weight is None:
-        methods.remove("compass_j_32ch")
+def run_kfold(samples):
+    indices = np.arange(len(samples))
+    kf = KFold(n_splits=N_FOLDS, shuffle=True, random_state=42)
 
-    per_sample_rows = []
-    fold_rows = []
+    all_results = []
+    fold_summaries = []
 
-    for fold_i, (tr_p, te_p) in enumerate(kf.split(pids)):
-        tr_set = {pids[i] for i in tr_p}
-        cal = [s for s in samples if s["patient_id"] in tr_set]
-        tst = [s for s in samples if s["patient_id"] not in tr_set]
+    for fold_idx, (cal_idx, test_idx) in enumerate(kf.split(indices)):
+        t_start = time()
+        print(f"\n{'='*60}")
+        print(f"  FOLD {fold_idx + 1}/{N_FOLDS}")
+        print(f"{'='*60}")
 
-        cy = np.array([s["y_true"] for s in cal])
-        ty = np.array([s["y_true"] for s in tst])
-        cyh = np.array([s["y_hard"] for s in cal])
-        tyh = np.array([s["y_hard"] for s in tst])
-        cys = np.array([s["y_soft"] for s in cal])
-        tys = np.array([s["y_soft"] for s in tst])
-        tau_scale = float(np.std(np.abs(cy - cyh))) + 1e-6
-        # Patient-cluster finite-sample correction (2 correlated frames ED & ES per patient)
-        alpha_cluster = max(alpha - 1.5 / max(len(tr_p), 1), 0.05)
+        cal_samples  = [samples[i] for i in cal_idx]
+        test_samples = [samples[i] for i in test_idx]
 
-        bounds = {}
+        n_cal = len(cal_samples)
+        n_test = len(test_samples)
 
-        # 1. Split CP (soft legacy + hard fair)
-        scp_s = calibrate(cy, cys, alpha_cluster, mode="abs")
-        bounds["scp_soft"] = predict_interval(tys, scp_s["q_hat"], mode="abs")
+        # Arrays for standard methods
+        cal_true   = np.array([s['y_true'] for s in cal_samples])
+        cal_pred   = np.array([s['y_pred'] for s in cal_samples])
+        cal_sigmas = np.array([s['sigma']  for s in cal_samples])
+        cal_sigmas_jac = np.array([s['sigma_jac'] for s in cal_samples])
+        cal_voxel_vols = np.array([s['voxel_vol'] for s in cal_samples])
 
-        scp_h = calibrate(cy, cyh, alpha_cluster, mode="abs")
-        bounds["scp_hard"] = predict_interval(tyh, scp_h["q_hat"], mode="abs")
+        test_true  = np.array([s['y_true'] for s in test_samples])
+        test_pred  = np.array([s['y_pred'] for s in test_samples])
+        test_sigmas = np.array([s['sigma'] for s in test_samples])
+        test_sigmas_jac = np.array([s['sigma_jac'] for s in test_samples])
 
-        # 2. Conformal Risk Control (Angelopoulos et al., ICLR 2024)
-        crc_r = find_lambda(cy, cyh, alpha_cluster, mode="abs", n_grid=2000)
-        bounds["crc"] = predict_interval(tyh, crc_r["lambda"], mode="abs")
+        cal_probs  = [s['probs'] for s in cal_samples]
+        cal_metric_fns = [s['metric_fn'] for s in cal_samples]
 
-        # 3. Adaptive Split CP (entropy & Jacobian sensitivity)
-        c_ent = np.array([s["entropy"] for s in cal])
-        t_ent = np.array([s["entropy"] for s in tst])
-        ascp_e = calibrate_normalized(cy, cyh, c_ent, alpha_cluster)
-        bounds["ascp_ent"] = predict_interval_normalized(tyh, t_ent, ascp_e["q_hat"])
+        #  SCP 
+        scp = calibrate(cal_true, cal_pred, ALPHA, mode='abs')
+        lo_scp, up_scp = predict_interval(test_pred, scp['q_hat'], mode='abs')
+        ev_scp = evaluate_coverage(test_true, lo_scp, up_scp)
 
-        c_sens = np.array([s["sens"] for s in cal])
-        t_sens = np.array([s["sens"] for s in tst])
-        ascp_s = calibrate_normalized(cy, cyh, c_sens, alpha_cluster)
-        bounds["ascp_sens"] = predict_interval_normalized(tyh, t_sens, ascp_s["q_hat"])
+        #  CRC 
+        crc = find_lambda(cal_true, cal_pred, ALPHA, mode='abs', n_grid=1000)
+        lo_crc, up_crc = predict_interval(test_pred, crc['lambda'], mode='abs')
+        ev_crc = evaluate_coverage(test_true, lo_crc, up_crc)
 
-        # 4. COMPASS-L (Cheung et al., ICLR 2026)
-        sc_l_cal = np.array([s["sc_l"] for s in cal])
-        beta_l = calibrate_compass(sc_l_cal, alpha_cluster)
-        lo_l, hi_l = zip(*[
-            predict_interval_compass(s["probs"], beta_l, target_class, s["metric_fn"])
-            for s in tst
-        ])
-        bounds["compass_l"] = (np.array(lo_l), np.array(hi_l))
+        #  ASCP (Adaptive SCP) 
+        ascp = calibrate_normalized(cal_true, cal_pred, cal_sigmas, ALPHA)
+        lo_ascp, up_ascp = predict_interval_normalized(test_pred, test_sigmas, ascp['q_hat'])
+        ev_ascp = evaluate_coverage(test_true, lo_ascp, up_ascp)
 
-        # 5. COMPASS-J (multi-class logit Jacobian PCA)
+        #  ACRC (Adaptive CRC) 
+        acrc = find_lambda_adaptive(cal_true, cal_pred, cal_sigmas, ALPHA)
+        lo_acrc, up_acrc = predict_interval_normalized(test_pred, test_sigmas, acrc['lambda'])
+        ev_acrc = evaluate_coverage(test_true, lo_acrc, up_acrc)
+
+        #  COMPASS-L (binary mask + binary search)
+        print("  Calibrating COMPASS-L...", flush=True)
+        scores_l = []
+        for i in tqdm(range(n_cal), desc="  COMPASS-L cal", leave=False):
+            sc = compass_l_score(cal_probs[i], float(cal_true[i]),
+                                 TARGET_CLASS, cal_metric_fns[i],
+                                 b_max=5.0, n_iter=12)
+            scores_l.append(sc)
+        beta_l = calibrate_compass(np.array(scores_l), ALPHA)
+
+        covs_l, wids_l = [], []
+        for s in test_samples:
+            lo, hi = predict_interval_compass(s['probs'], beta_l,
+                                               TARGET_CLASS, s['metric_fn'])
+            covs_l.append(1.0 if lo <= s['y_true'] <= hi else 0.0)
+            wids_l.append(hi - lo)
+        ev_cl = {'coverage': float(np.mean(covs_l)), 'mean_width': float(np.mean(wids_l))}
+
+        #  COMPASS-J (binary mask + shared PCA subspace)
+        print("  Calibrating COMPASS-J (shared PCA subspace)...", flush=True)
         V_L_j, cal_dirs_j = compute_shared_directions(
-            [s["probs"] for s in cal],
-            target_class,
-            [s["voxel_vol"] for s in cal],
-            n_components=4,
+            cal_probs, TARGET_CLASS,
+            [float(s['voxel_vol']) for s in cal_samples],
+            n_components=N_PCA,
         )
-        V_L_jt = torch.tensor(V_L_j, dtype=torch.float32, device=DEVICE)
-        P_c = V_L_jt.T @ V_L_jt
-        sc_j_cal = np.array([
-            compass_j_score(
-                s["probs"], s["y_true"], target_class, s["metric_fn"],
-                cal_dirs_j[i], b_max=15.0, n_iter=14,
+
+        scores_j = []
+        for i in tqdm(range(n_cal), desc="  COMPASS-J cal", leave=False):
+            sc = compass_j_score(cal_probs[i], float(cal_true[i]),
+                                 TARGET_CLASS, cal_metric_fns[i],
+                                 cal_dirs_j[i], b_max=5.0, n_iter=12)
+            scores_j.append(sc)
+        beta_j = calibrate_compass_j(np.array(scores_j), ALPHA)
+
+        covs_j, wids_j = [], []
+        for s in test_samples:
+            J_test = compute_volume_jacobian(s['probs'], TARGET_CLASS, s['voxel_vol'])
+            J_pooled = J_test.sum(dim=[1, 2, 3])
+            chan_w = torch.tensor(V_L_j, dtype=J_test.dtype, device=J_test.device)
+            weights = (chan_w @ J_pooled) @ chan_w  # [C]
+            dir_test = torch.ones_like(J_test)
+            for c in range(J_test.shape[0]):
+                dir_test[c] *= weights[c]
+            abs_max = dir_test.abs().max()
+            if abs_max > 1e-8:
+                dir_test = dir_test / abs_max
+            lo, hi = predict_interval_compass_j(
+                s['probs'], beta_j, TARGET_CLASS, s['metric_fn'], dir_test,
             )
-            for i, s in enumerate(cal)
-        ])
-        beta_j = calibrate_compass_j(sc_j_cal, alpha_cluster)
-        lo_j, hi_j = [], []
-        for s in tst:
-            J_z = compute_multiclass_logit_jacobian(s["probs"], target_class, s["voxel_vol"])
-            d_t = (P_c @ J_z.reshape(J_z.shape[0], -1)).reshape(J_z.shape)
-            amax = d_t.abs().max()
-            if amax > 1e-8:
-                d_t = d_t / amax
-            lo_v, hi_v = predict_interval_compass_j(
-                s["probs"], beta_j, target_class, s["metric_fn"], d_t
+            covs_j.append(1.0 if lo <= s['y_true'] <= hi else 0.0)
+            wids_j.append(hi - lo)
+        ev_cj = {'coverage': float(np.mean(covs_j)), 'mean_width': float(np.mean(wids_j))}
+        print("  Calibrating CRC-FS-L [GENUINE] (Theorem 2.1)...", flush=True)
+        crcfs_l = calibrate_crc_fs_l_from_scores(
+            np.array(scores_l), cal_sigmas_jac, ALPHA, mode='coverage',
+        )
+        lam_fsl = crcfs_l['lambda_hat']     # risk-controlled threshold (normalized)
+        tau_fsl = crcfs_l['tau']            # global loss scale
+        risk_fsl = crcfs_l['risk']
+
+        covs_fsl, wids_fsl = [], []
+        for s in test_samples:
+            lo, hi = predict_interval_crc_fs_l(
+                s['probs'], lam_fsl, s['sigma_jac'], 0.0,
+                TARGET_CLASS, s['metric_fn'],
             )
-            lo_j.append(lo_v)
-            hi_j.append(hi_v)
-        bounds["compass_j"] = (np.array(lo_j), np.array(hi_j))
+            covs_fsl.append(1.0 if lo <= s['y_true'] <= hi else 0.0)
+            wids_fsl.append(hi - lo)
+        ev_fsl = {'coverage': float(np.mean(covs_fsl)), 'mean_width': float(np.mean(wids_fsl)),
+                  'risk': risk_fsl}
 
-        # 6. COMPASS-J 32ch (true intermediate-feature PCA via seg_outputs[-1] weight W)
-        if head_weight is not None:
-            V_L_h, cal_dirs_h = compute_hidden_feature_subspace(
-                [s["probs"] for s in cal],
-                target_class,
-                [s["voxel_vol"] for s in cal],
-                head_weight,
-                n_components=5,
+        #  CRC-FS-J [GENUINE] (CRC Theorem 2.1 + Jacobian subspace)
+        print("  Calibrating CRC-FS-J [GENUINE]...", flush=True)
+        crcfsj = calibrate_crc_fs_j(
+            cal_probs, cal_true, cal_sigmas_jac, cal_voxel_vols,
+            TARGET_CLASS, cal_metric_fns, ALPHA,
+            b_max=5.0, n_iter=12, n_pca_components=N_PCA, mode='coverage',
+        )
+        covs_fsj, wids_fsj = [], []
+        V_L_fsj = crcfsj.get('V_L')
+        lam_j = crcfsj['lambda_hat']
+        risk_fsj = crcfsj['risk']
+        for s in test_samples:
+            lo, hi = predict_interval_crc_fs_j(
+                s['probs'], lam_j, s['sigma_jac'], 0.0,
+                TARGET_CLASS, s['metric_fn'], s['voxel_vol'], V_L_fsj,
             )
-            sc_h_cal = np.array([
-                compass_j_score(
-                    s["probs"], s["y_true"], target_class, s["metric_fn"],
-                    cal_dirs_h[i], b_max=15.0, n_iter=14,
-                )
-                for i, s in enumerate(cal)
-            ])
-            beta_h = calibrate_compass_j(sc_h_cal, alpha_cluster)
-            lo_h, hi_h = zip(*[
-                predict_interval_compass_j(
-                    s["probs"], beta_h, target_class, s["metric_fn"],
-                    hidden_feature_direction_for_sample(
-                        s["probs"], target_class, s["voxel_vol"], head_weight, V_L_h
-                    ),
-                )
-                for s in tst
-            ])
-            bounds["compass_j_32ch"] = (np.array(lo_h), np.array(hi_h))
+            covs_fsj.append(1.0 if lo <= s['y_true'] <= hi else 0.0)
+            wids_fsj.append(hi - lo)
+        ev_fsj = {'coverage': float(np.mean(covs_fsj)), 'mean_width': float(np.mean(wids_fsj)),
+                  'risk': risk_fsj}
 
-        # 7. Legacy CRC-FS-L
-        c_sig_jac = np.array([s["sigma_jac"] for s in cal])
-        cfs_leg = calibrate_crc_fs_l_from_scores(sc_l_cal, c_sig_jac, alpha, mode="coverage")
-        lo_leg, hi_leg = zip(*[
-            predict_interval_crc_fs_l(
-                s["probs"], cfs_leg["lambda_hat"], s["sigma_jac"], 0.0,
-                target_class, s["metric_fn"],
-            )
-            for s in tst
-        ])
-        bounds["crc_fs_legacy"] = (np.array(lo_leg), np.array(hi_leg))
+        #  Collect per-sample results ─
+        for i, s in enumerate(test_samples):
+            all_results.append({
+                'fold': fold_idx + 1,
+                'patient_id': s['patient_id'],
+                'y_true': s['y_true'],
+                'y_pred': s['y_pred'],
+                'sigma': s['sigma'],
+                # SCP
+                'scp_covered': int(lo_scp[i] <= s['y_true'] <= up_scp[i]),
+                'scp_width': float(up_scp[i] - lo_scp[i]),
+                # CRC
+                'crc_covered': int(lo_crc[i] <= s['y_true'] <= up_crc[i]),
+                'crc_width': float(up_crc[i] - lo_crc[i]),
+                # ASCP
+                'ascp_covered': int(lo_ascp[i] <= s['y_true'] <= up_ascp[i]),
+                'ascp_width': float(up_ascp[i] - lo_ascp[i]),
+                # ACRC
+                'acrc_covered': int(lo_acrc[i] <= s['y_true'] <= up_acrc[i]),
+                'acrc_width': float(up_acrc[i] - lo_acrc[i]),
+                # COMPASS-L
+                'compassl_covered': covs_l[i],
+                'compassl_width': wids_l[i],
+                # COMPASS-J
+                'compassj_covered': covs_j[i],
+                'compassj_width': wids_j[i],
+                # CRC-FS-L [NEW]
+                'crcfsl_covered': covs_fsl[i],
+                'crcfsl_width': wids_fsl[i],
+                # CRC-FS-J [NEW]
+                'crcfsj_covered': covs_fsj[i],
+                'crcfsj_width': wids_fsj[i],
+            })
 
-        # 8. CRC-FS family (Ours: CRC-FS-L & CRC-FS-J)
-        r_oof = calibrate_and_predict_crc_fs(
-            cal, tst, alpha=alpha, mode="crc_fs_j", target_class=target_class,
-            project_manifold=False, seed=fold_i,
-        )
-        bounds["dacrc_oof"] = (r_oof["lower"], r_oof["upper"])
-
-        r_cvp = calibrate_and_predict_crc_fs(
-            cal, tst, alpha=alpha, mode="crc_fs_l", target_class=target_class,
-            project_manifold=False, seed=fold_i,
-        )
-        bounds["dacrc_cv_plus"] = (r_cvp["lower"], r_cvp["upper"])
-
-        r_man = calibrate_and_predict_crc_fs(
-            cal, tst, alpha=alpha, mode="crc_fs_j", target_class=target_class,
-            project_manifold=True, seed=fold_i,
-        )
-        bounds["dacrc_manifold"] = (r_man["lower"], r_man["upper"])
-
-        r_mon = calibrate_and_predict_crc_fs(
-            cal, tst, alpha=alpha, mode="mondrian_shrink", target_class=target_class,
-            project_manifold=False, seed=fold_i,
-        )
-        bounds["dacrc_mondrian"] = (r_mon["lower"], r_mon["upper"])
-
-        r_risk = calibrate_and_predict_crc_fs(
-            cal, tst, alpha=alpha, mode="risk_crc", target_class=target_class,
-            project_manifold=False, seed=fold_i,
-        )
-        bounds["dacrc_risk_crc"] = (r_risk["lower"], r_risk["upper"])
-
-        fold_rec = {"dataset": split_name, "organ": organ_name, "fold": fold_i + 1}
-        for m in methods:
-            lo_m, hi_m = bounds[m]
-            lo_m = np.maximum(lo_m, 0.0)
-            hi_m = np.maximum(hi_m, lo_m)
-            cov_m = float(np.mean((ty >= lo_m) & (ty <= hi_m)))
-            wid_m = float(np.mean(hi_m - lo_m))
-            sev_m = bounded_severity_risk(ty, lo_m, hi_m, tau_scale)
-            fold_rec[f"{m}_cov"] = cov_m
-            fold_rec[f"{m}_wid"] = wid_m
-            fold_rec[f"{m}_sev"] = sev_m
-        fold_rows.append(fold_rec)
-
-        for i, s in enumerate(tst):
-            row = {
-                "dataset": split_name,
-                "organ": organ_name,
-                "fold": fold_i + 1,
-                "patient_id": s["patient_id"],
-                "frame": s["frame"],
-                "group": s["group"],
-                "y_true": s["y_true"],
-                "y_pred_hard": s["y_hard"],
-                "y_pred_soft": s["y_soft"],
-                "abs_err_hard": abs(s["y_true"] - s["y_hard"]),
-                "tau_scale": tau_scale,
-            }
-            for m in methods:
-                lo_v = float(max(bounds[m][0][i], 0.0))
-                hi_v = float(max(bounds[m][1][i], lo_v))
-                row[f"{m}_covered"] = int(lo_v <= s["y_true"] <= hi_v)
-                row[f"{m}_width"] = hi_v - lo_v
-                row[f"{m}_miss_dist"] = max(lo_v - s["y_true"], s["y_true"] - hi_v, 0.0)
-            per_sample_rows.append(row)
-
-    return pd.DataFrame(per_sample_rows), pd.DataFrame(fold_rows)
-
-
-def evaluate_ef_kfold(
-    samples_lv: list,
-    split_name: str,
-    alpha: float = 0.1,
-    n_folds: int = 5,
-) -> pd.DataFrame:
-    """Evaluate LV Ejection Fraction (%) across patients."""
-    pat_map = {}
-    for s in samples_lv:
-        pid = s["patient_id"]
-        pat_map.setdefault(pid, {"group": s["group"]})
-        if s["frame"] == s["ed_frame"]:
-            pat_map[pid]["ed"] = s
-        elif s["frame"] == s["es_frame"]:
-            pat_map[pid]["es"] = s
-
-    ef_samples = []
-    for pid, d in sorted(pat_map.items()):
-        if "ed" not in d or "es" not in d:
-            continue
-        ed, es = d["ed"], d["es"]
-        ef_true = float(np.clip((ed["y_true"] - es["y_true"]) / max(ed["y_true"], 1e-6) * 100.0, 0, 100))
-        ef_feats = extract_ef_directional_features(ed, es)
-
-        edv_h = max(float(ed["y_hard"]), 1.0)
-        esv_h = max(float(es["y_hard"]), 0.0)
-        dedv = 100.0 * esv_h / (edv_h ** 2)
-        desv = 100.0 / edv_h
-        sig_compass = max(float(np.hypot(dedv * float(ed["sens"]), desv * float(es["sens"]))), 0.05)
-        sc_ef_l = abs(ef_true - float(ef_feats["y_hard"])) / sig_compass
-
-        ef_samples.append({
-            "patient_id": pid,
-            "group": d["group"],
-            "y_true": ef_true,
-            "sc_ef_l": sc_ef_l,
-            "sig_compass": sig_compass,
-            **ef_feats,
+        #  Fold summary 
+        t_elapsed = time() - t_start
+        fold_summaries.append({
+            'fold': fold_idx + 1,
+            'scp_cov': ev_scp['coverage'], 'scp_wid': ev_scp['mean_width'],
+            'crc_cov': ev_crc['coverage'], 'crc_wid': ev_crc['mean_width'],
+            'ascp_cov': ev_ascp['coverage'], 'ascp_wid': ev_ascp['mean_width'],
+            'acrc_cov': ev_acrc['coverage'], 'acrc_wid': ev_acrc['mean_width'],
+            'compassl_cov': ev_cl['coverage'], 'compassl_wid': ev_cl['mean_width'],
+            'compassj_cov': ev_cj['coverage'], 'compassj_wid': ev_cj['mean_width'],
+            'crcfsl_cov': ev_fsl['coverage'], 'crcfsl_wid': ev_fsl['mean_width'],
+            'crcfsj_cov': ev_fsj['coverage'], 'crcfsj_wid': ev_fsj['mean_width'],
         })
 
-    kf = KFold(n_splits=n_folds, shuffle=True, random_state=42)
-    rows = []
-    for fold_i, (tr_i, te_i) in enumerate(kf.split(ef_samples)):
-        cal = [ef_samples[i] for i in tr_i]
-        tst = [ef_samples[i] for i in te_i]
-        cy = np.array([s["y_true"] for s in cal])
-        ty = np.array([s["y_true"] for s in tst])
-        cyh = np.array([s["y_hard"] for s in cal])
-        tyh = np.array([s["y_hard"] for s in tst])
+        print(f"\n  Fold {fold_idx+1} Results (time: {t_elapsed:.0f}s):")
+        print(f"  {'Method':<16} {'Coverage':>10} {'Width':>10}")
+        print(f"  {'-'*36}")
+        for name, cov, wid in [
+            ('SCP', ev_scp['coverage'], ev_scp['mean_width']),
+            ('CRC', ev_crc['coverage'], ev_crc['mean_width']),
+            ('ASCP', ev_ascp['coverage'], ev_ascp['mean_width']),
+            ('ACRC', ev_acrc['coverage'], ev_acrc['mean_width']),
+            ('COMPASS-L', ev_cl['coverage'], ev_cl['mean_width']),
+            ('COMPASS-J', ev_cj['coverage'], ev_cj['mean_width']),
+            ('CRC-FS-L [NEW]', ev_fsl['coverage'], ev_fsl['mean_width']),
+            ('CRC-FS-J [NEW]', ev_fsj['coverage'], ev_fsj['mean_width']),
+        ]:
+            marker = ' ' if cov >= (1-ALPHA) - 0.02 else ' '
+            print(f"  {name:<16} {cov*100:>9.1f}% {wid:>9.2f} mL{marker}")
 
-        # Cluster-safe alpha adjustments on EF
-        alpha_ef_crc = max(alpha - 1.5 / max(len(cal), 1), 0.05)
-        qh = conformal_quantile(np.abs(cy - cyh), alpha)
-        lo_s, hi_s = np.clip(tyh - qh, 0, 100), np.clip(tyh + qh, 0, 100)
-
-        crc_ef = find_lambda(cy, cyh, alpha_ef_crc, mode="abs", n_grid=2000)
-        lo_crc, hi_crc = np.clip(tyh - crc_ef["lambda"], 0, 100), np.clip(tyh + crc_ef["lambda"], 0, 100)
-
-        # Normalize COMPASS-L on EF cleanly across scales (sensitivity in mL -> %EF units)
-        sc_cal_ef = np.array([s["sc_ef_l"] for s in cal])
-        bl = conformal_quantile(sc_cal_ef, alpha)
-        sig_c_tst = np.array([s["sig_compass"] for s in tst])
-        lo_c2, hi_c2 = np.clip(tyh - bl * sig_c_tst, 0, 100), np.clip(tyh + bl * sig_c_tst, 0, 100)
-
-        r_ef = calibrate_and_predict_ef_crc_fs(cal, tst, alpha=alpha, seed=fold_i)
-        lo_d, hi_d = r_ef["lower"], r_ef["upper"]
-
-        for j, s in enumerate(tst):
-            rows.append({
-                "dataset": split_name,
-                "patient_id": s["patient_id"],
-                "group": s["group"],
-                "y_true": s["y_true"],
-                "y_pred_hard": s["y_hard"],
-                "scp_hard_covered": int(lo_s[j] <= s["y_true"] <= hi_s[j]),
-                "scp_hard_width": float(hi_s[j] - lo_s[j]),
-                "crc_covered": int(lo_crc[j] <= s["y_true"] <= hi_crc[j]),
-                "crc_width": float(hi_crc[j] - lo_crc[j]),
-                "compass_l_covered": int(lo_c2[j] <= s["y_true"] <= hi_c2[j]),
-                "compass_l_width": float(hi_c2[j] - lo_c2[j]),
-                "dacrc_ef_covered": int(lo_d[j] <= s["y_true"] <= hi_d[j]),
-                "dacrc_ef_width": float(hi_d[j] - lo_d[j]),
-            })
-    return pd.DataFrame(rows)
+    return pd.DataFrame(all_results), pd.DataFrame(fold_summaries)
 
 
-def summarize_benchmark(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute summary statistics per (dataset, organ, method)."""
-    base_methods = [
-        "scp_soft", "scp_hard", "crc", "ascp_ent", "ascp_sens",
-        "compass_l", "compass_j", "compass_j_32ch", "crc_fs_legacy",
-        "dacrc_oof", "dacrc_cv_plus", "dacrc_manifold",
-        "dacrc_mondrian", "dacrc_risk_crc",
+#  3. Summarize 
+
+def print_summary(df: pd.DataFrame, fold_df: pd.DataFrame):
+    """In bảng tổng hợp + phân tích thống kê."""
+    methods = [
+        ('scp',       'Split CP (Baseline)',      '#E74C3C'),
+        ('crc',       'CRC (Theorem 2.1)',         '#3498DB'),
+        ('ascp',      'Adaptive SCP',              '#E67E22'),
+        ('acrc',      'Adaptive CRC',              '#9B59B6'),
+        ('compassl',  'COMPASS-L (Logit Shift)',   '#1ABC9C'),
+        ('compassj',  'COMPASS-J (Jacobian PCA)',  '#F39C12'),
+        ('crcfsl',    'CRC-FS-L [NEW] (OURS)',         '#27AE60'),
+        ('crcfsj',    'CRC-FS-J [NEW] (OURS)',         '#2C3E50'),
     ]
-    summary_rows = []
-    for (ds, org), gdf in df.groupby(["dataset", "organ"], sort=False):
-        ref_crc = gdf["crc_width"].values
-        ref_cl = gdf["compass_l_width"].values
-        for m in base_methods:
-            if f"{m}_width" not in gdf.columns or gdf[f"{m}_width"].isna().all():
-                continue
-            cov = float(gdf[f"{m}_covered"].mean()) * 100.0
-            wid = float(gdf[f"{m}_width"].mean())
-            med_w = float(gdf[f"{m}_width"].median())
-            sev = float((np.minimum(1.0, gdf[f"{m}_miss_dist"] / gdf["tau_scale"])).mean())
-            w_arr = gdf[f"{m}_width"].values
-            e_arr = gdf["abs_err_hard"].values
-            corr = float(np.corrcoef(w_arr, e_arr)[0, 1]) if np.std(w_arr) > 1e-8 else 0.0
 
-            grp_covs = [float(gg[f"{m}_covered"].mean()) * 100.0 for _, gg in gdf.groupby("group")]
-            min_grp_cov = min(grp_covs)
-            cond_cov_gap = max(grp_covs) - min(grp_covs)
+    print("\n" + "=" * 80)
+    print(f"FINAL RESULTS — ACDC LV Volume, Target Coverage = {(1-ALPHA)*100:.0f}%")
+    print("=" * 80)
+    print(f"{'Method':<35} {'Coverage':>10} {'Width':>10} {'vs SCP':>9} {'Status':>8}")
+    print("-" * 80)
 
-            try:
-                p_vs_crc = float(wilcoxon(w_arr, ref_crc).pvalue)
-            except Exception:
-                p_vs_crc = 1.0
-            try:
-                p_vs_cl = float(wilcoxon(w_arr, ref_cl).pvalue)
-            except Exception:
-                p_vs_cl = 1.0
+    scp_width = df['scp_width'].mean()
+    scp_cov   = df['scp_covered'].mean()
 
-            summary_rows.append({
-                "dataset": ds,
-                "organ": org,
-                "method": m,
-                "coverage_pct": cov,
-                "mean_width": wid,
-                "median_width": med_w,
-                "severity_risk": sev,
-                "corr_width_err": corr,
-                "min_group_cov_pct": min_grp_cov,
-                "cond_cov_gap_pct": cond_cov_gap,
-                "vs_crc_pct": (wid - float(np.mean(ref_crc))) / float(np.mean(ref_crc)) * 100.0,
-                "vs_compass_l_pct": (wid - float(np.mean(ref_cl))) / float(np.mean(ref_cl)) * 100.0,
-                "p_vs_crc": p_vs_crc,
-                "p_vs_compass_l": p_vs_cl,
-            })
-    return pd.DataFrame(summary_rows)
+    best_wid = float('inf')
+    best_name = ""
+    valid_methods = []
 
-
-def generate_figures(summary_df: pd.DataFrame, fig_dir: Path, alpha: float) -> None:
-    """Create comparison plots in results/figures/."""
-    fig_dir.mkdir(parents=True, exist_ok=True)
-
-    test_3d = summary_df[summary_df["dataset"] == "testing_3d"]
-    if not test_3d.empty:
-        sel_methods = [
-            ("scp_hard", "Split CP\n(Hard)", "#7F8C8D"),
-            ("crc", "CRC\n(ICLR'24)", "#E74C3C"),
-            ("ascp_sens", "Adaptive\nSCP", "#E67E22"),
-            ("compass_l", "COMPASS-L\n(ICLR'26)", "#1ABC9C"),
-            ("compass_j_32ch", "COMPASS-J\n(ICLR'26)", "#F39C12"),
-            ("dacrc_cv_plus", "CRC-FS-L\n(Ours)", "#27AE60"),
-            ("dacrc_oof", "CRC-FS-J\n(Ours)", "#16A085"),
-        ]
-        organs = [o for o in ("LV", "RV", "MYO") if o in test_3d["organ"].values]
-        fig, axes = plt.subplots(2, len(organs), figsize=(5.6 * len(organs), 8.5), sharex=False)
-        if len(organs) == 1:
-            axes = axes[:, None]
-        fig.suptitle(
-            f"CRC-FS (CRC-FS-L & CRC-FS-J) vs. Conformal Risk Control (ICLR 2024) & COMPASS (ICLR 2026) — ACDC Unseen Test Set (Target {(1-alpha)*100:.0f}%)",
-            fontsize=12.5, fontweight="bold",
-        )
-        for col_i, org in enumerate(organs):
-            sub = test_3d[test_3d["organ"] == org].set_index("method")
-            ms = [(k, lbl, c) for k, lbl, c in sel_methods if k in sub.index]
-            xs = np.arange(len(ms))
-            covs = [sub.loc[k, "coverage_pct"] for k, _, _ in ms]
-            wids = [sub.loc[k, "mean_width"] for k, _, _ in ms]
-            cols = [c for _, _, c in ms]
-            lbls = [lbl for _, lbl, _ in ms]
-
-            ax_top = axes[0, col_i]
-            bars_c = ax_top.bar(xs, covs, color=cols, edgecolor="black", linewidth=0.7)
-            ax_top.axhline((1 - alpha) * 100, color="red", linestyle="--", linewidth=1.4)
-            ax_top.set_title(f"{org} Volume — Coverage (%)", fontweight="bold")
-            ax_top.set_ylim(75, 102)
-            ax_top.set_xticks(xs)
-            ax_top.set_xticklabels(lbls, fontsize=7.5)
-            ax_top.grid(axis="y", linestyle=":", alpha=0.4)
-            for b, v in zip(bars_c, covs):
-                ax_top.text(b.get_x() + b.get_width() / 2, v + 0.5, f"{v:.1f}%", ha="center", va="bottom", fontsize=7.5, fontweight="bold")
-
-            ax_bot = axes[1, col_i]
-            bars_w = ax_bot.bar(xs, wids, color=cols, edgecolor="black", linewidth=0.7)
-            ax_bot.set_title(f"{org} Volume — Mean Width (mL, Lower=Better)", fontweight="bold")
-            ax_bot.set_ylim(0, max(wids) * 1.2)
-            ax_bot.set_xticks(xs)
-            ax_bot.set_xticklabels(lbls, fontsize=7.5)
-            ax_bot.grid(axis="y", linestyle=":", alpha=0.4)
-            for b, v in zip(bars_w, wids):
-                ax_bot.text(b.get_x() + b.get_width() / 2, v + max(wids) * 0.015, f"{v:.1f}", ha="center", va="bottom", fontsize=7.5, fontweight="bold")
-
-        plt.tight_layout()
-        out_multi = fig_dir / "crc_fs_multi_organ.png"
-        plt.savefig(str(out_multi), dpi=250, bbox_inches="tight")
-        plt.close(fig)
-
-    primary = summary_df[(summary_df["dataset"] == "testing_3d") & (summary_df["organ"] == "LV")]
-    if primary.empty:
-        primary = summary_df[summary_df["organ"] == "LV"].head(15)
-    if not primary.empty:
-        sub = primary.set_index("method")
-        plot_ms = [
-            ("scp_hard", "Split CP\n(Hard)", "#7F8C8D"),
-            ("crc", "CRC\n(ICLR'24)", "#E74C3C"),
-            ("ascp_sens", "Adaptive\nSCP", "#E67E22"),
-            ("compass_l", "COMPASS-L", "#1ABC9C"),
-            ("compass_j_32ch", "COMPASS-J\n(32ch)", "#F39C12"),
-            ("dacrc_cv_plus", "CRC-FS-L\n(Ours)", "#27AE60"),
-            ("dacrc_oof", "CRC-FS-J\n(Ours)", "#16A085"),
-        ]
-        plot_ms = [(k, l, c) for k, l, c in plot_ms if k in sub.index]
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
-        xs = np.arange(len(plot_ms))
-        covs = [sub.loc[k, "coverage_pct"] for k, _, _ in plot_ms]
-        wids = [sub.loc[k, "mean_width"] for k, _, _ in plot_ms]
-        cols = [c for _, _, c in plot_ms]
-        lbls = [l for _, l, _ in plot_ms]
-
-        ax1.bar(xs, covs, color=cols, edgecolor="black", linewidth=0.8)
-        ax1.axhline((1 - alpha) * 100, color="red", linestyle="--", linewidth=1.5)
-        ax1.set_title("Empirical Coverage (%) — LV Volume", fontweight="bold")
-        ax1.set_ylim(75, 102)
-        ax1.set_xticks(xs); ax1.set_xticklabels(lbls, fontsize=8.5)
-        ax1.grid(axis="y", linestyle=":", alpha=0.4)
-        for i, v in enumerate(covs):
-            ax1.text(i, v + 0.5, f"{v:.1f}%", ha="center", va="bottom", fontsize=8, fontweight="bold")
-
-        ax2.bar(xs, wids, color=cols, edgecolor="black", linewidth=0.8)
-        ax2.set_title("Mean Interval Width (mL, Smaller = Better)", fontweight="bold")
-        ax2.set_ylim(0, max(wids) * 1.2)
-        ax2.set_xticks(xs); ax2.set_xticklabels(lbls, fontsize=8.5)
-        ax2.grid(axis="y", linestyle=":", alpha=0.4)
-        for i, v in enumerate(wids):
-            ax2.text(i, v + max(wids) * 0.015, f"{v:.2f}", ha="center", va="bottom", fontsize=8, fontweight="bold")
-
-        plt.tight_layout()
-        plt.savefig(str(fig_dir / "crc_fs_full_comparison.png"), dpi=250, bbox_inches="tight")
-        plt.close(fig)
-
-        fig2, ax = plt.subplots(figsize=(9, 6))
-        for k, lbl, c in plot_ms:
-            lbl_clean = lbl.replace("\n", " ")
-            size = 240 if "dacrc" in k else 130
-            ax.scatter(sub.loc[k, "mean_width"], sub.loc[k, "coverage_pct"], c=c, s=size, edgecolors="black", label=lbl_clean, zorder=4 if "dacrc" in k else 3)
-        ax.axhline((1 - alpha) * 100, color="red", linestyle="--", linewidth=1.4, label=f"Target {(1-alpha)*100:.0f}%")
-        ax.set_xlabel("Mean Interval Width (mL) — Smaller is Better")
-        ax.set_ylabel("Empirical Coverage (%) — Higher is Better")
-        ax.set_title("Width vs. Coverage Pareto Frontier (Top-Left = Optimal)", fontweight="bold")
-        ax.grid(True, alpha=0.3)
-        ax.legend(fontsize=8.5, loc="lower right")
-        plt.tight_layout()
-        plt.savefig(str(fig_dir / "crc_fs_pareto.png"), dpi=250, bbox_inches="tight")
-        plt.close(fig2)
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Run ACDC DA-CRC-FS vs CRC (ICLR 2024) & COMPASS benchmark")
-    parser.add_argument("--split", type=str, default="all", choices=["testing", "training", "all"])
-    parser.add_argument("--model", type=str, default="3d_fullres", choices=["3d_fullres", "2d", "both"])
-    parser.add_argument("--organs", nargs="+", default=["LV", "RV", "MYO"], choices=["LV", "RV", "MYO"])
-    parser.add_argument("--alpha", type=float, default=0.1)
-    parser.add_argument("--skip_ef", action="store_true")
-    args = parser.parse_args()
-
-    results_dir = WORKSPACE_DIR / "results"
-    tables_dir = results_dir / "tables"
-    fig_dir = results_dir / "figures"
-    results_dir.mkdir(parents=True, exist_ok=True)
-    tables_dir.mkdir(parents=True, exist_ok=True)
-    fig_dir.mkdir(parents=True, exist_ok=True)
-
-    runs = []
-    if args.split in ("testing", "all"):
-        if args.model in ("3d_fullres", "both"):
-            runs.append(("testing_3d", WORKSPACE_DIR / "data_ACDC/testing", WORKSPACE_DIR / "nnunet_output_testing", "3d_fullres"))
-        if args.model in ("2d", "both") and (WORKSPACE_DIR / "nnunet_output_testing_2d").exists():
-            runs.append(("testing_2d", WORKSPACE_DIR / "data_ACDC/testing", WORKSPACE_DIR / "nnunet_output_testing_2d", "2d"))
-    if args.split in ("training", "all"):
-        runs.append(("training_3d", WORKSPACE_DIR / "data_ACDC/training", WORKSPACE_DIR / "nnunet_output", "3d_fullres"))
-
-    all_sample_dfs = []
-    all_fold_dfs = []
-    ef_dfs = []
-
-    t0 = time()
-    for ds_name, data_dir, pred_dir, model_type in runs:
-        if not pred_dir.exists() or not any(pred_dir.glob("*.npz")):
-            print(f"[SKIP] Missing .npz predictions in {pred_dir}", flush=True)
+    for key, name, _ in methods:
+        cov_col = f'{key}_covered'
+        wid_col = f'{key}_width'
+        if cov_col not in df.columns:
             continue
-        head_w = load_head_weight(model_type)
-        print(f"\n>>> Dataset: {ds_name} | Head weight: {None if head_w is None else head_w.shape}", flush=True)
 
-        for org in args.organs:
-            t_org = time()
-            cls_id = ORGAN_CLASSES[org]
-            samples = load_samples(data_dir, pred_dir, cls_id, head_weight=head_w)
-            print(f"  [{ds_name} | {org}] Loaded {len(samples)} frames...", flush=True)
-            df_s, df_f = evaluate_organ_kfold(samples, cls_id, org, ds_name, head_w, alpha=args.alpha)
-            all_sample_dfs.append(df_s)
-            all_fold_dfs.append(df_f)
-            print(f"  [{ds_name} | {org}] Completed in {time() - t_org:.1f}s", flush=True)
+        cov = df[cov_col].mean() * 100
+        wid = df[wid_col].mean()
 
-            if org == "LV" and not args.skip_ef:
-                ef_df = evaluate_ef_kfold(samples, ds_name, alpha=args.alpha)
-                ef_dfs.append(ef_df)
+        # Std from folds
+        if key in fold_df.columns or f'{key}_cov' in fold_df.columns:
+            fold_key_cov = f'{key}_cov' if f'{key}_cov' in fold_df.columns else key
+            fold_key_wid = f'{key}_wid' if f'{key}_wid' in fold_df.columns else key
 
-    df_all = pd.concat(all_sample_dfs, ignore_index=True)
-    df_folds = pd.concat(all_fold_dfs, ignore_index=True)
-    summary_df = summarize_benchmark(df_all)
+        diff = (wid - scp_width) / scp_width * 100
+        status = 'VALID' if cov >= (1-ALPHA)*100 - 1 else 'LOW'
+        marker = 'BEST' if wid < best_wid and cov >= (1-ALPHA)*100 - 1 else ''
+        if wid < best_wid and cov >= (1-ALPHA)*100 - 1:
+            best_wid = wid
+            best_name = name
 
-    summary_df.to_csv(str(tables_dir / "benchmark_summary.csv"), index=False)
-    df_all.to_csv(str(tables_dir / "per_sample_results.csv"), index=False)
-    primary_mask = (df_all["dataset"] == runs[0][0]) & (df_all["organ"] == args.organs[0])
-    df_all[primary_mask].to_csv(str(results_dir / "crc_fs_results.csv"), index=False)
-    df_folds.to_csv(str(results_dir / "crc_fs_fold_summary.csv"), index=False)
+        print(f"  {name:<33} {cov:>8.1f}% {wid:>9.2f} mL {diff:>+8.1f}% {status:>8}{marker}")
+        valid_methods.append((name, cov, wid, diff, status.strip(), key))
 
-    if ef_dfs:
-        df_ef = pd.concat(ef_dfs, ignore_index=True)
-        df_ef.to_csv(str(tables_dir / "ef_results.csv"), index=False)
+    print("-" * 80)
+    print(f"  [NEW] Best valid method: {best_name} (width={best_wid:.2f} mL)")
+    print("=" * 80)
 
-    generate_figures(summary_df, fig_dir, args.alpha)
+    # Statistical comparison: CRC-FS vs baselines
+    print("\n--- Statistical Analysis (paired per-sample) ---")
+    for our_key, our_name in [('crcfsl', 'CRC-FS-L'), ('crcfsj', 'CRC-FS-J')]:
+        if f'{our_key}_width' not in df.columns:
+            continue
+        our_wids = df[f'{our_key}_width'].values
+        scp_wids = df['scp_width'].values
+        cl_wids  = df['compassl_width'].values
 
-    print("\n" + "=" * 108)
-    print(f"BENCHMARK SUMMARY — ACDC (Target Coverage = {(1 - args.alpha)*100:.0f}%, Patient-Level 5-Fold CV)")
-    print("=" * 108)
-    display_names = {
-        "dacrc_oof": "crc_fs_j",
-        "dacrc_cv_plus": "crc_fs_l",
-        "dacrc_manifold": "crc_fs_manifold",
-        "dacrc_mondrian": "crc_fs_mondrian",
-        "dacrc_risk_crc": "crc_fs_risk",
-        "dacrc_ef": "crc_fs_ef",
-    }
-    for (ds, org), sub in summary_df.groupby(["dataset", "organ"], sort=False):
-        print(f"\n--- {ds} | {org} ---")
-        print(
-            f"{'Method':<18} {'Cov(%)':>7} {'MeanW':>8} {'MedW':>8} {'SevRisk':>8} "
-            f"{'Corr(W,e)':>10} {'MinGrp':>7} {'GrpGap':>7} {'vs CRC':>9} {'vs COMPASS-L':>13}"
-        )
-        for _, r in sub.iterrows():
-            m_disp = display_names.get(r["method"], r["method"])
-            print(
-                f"{m_disp:<18} {r['coverage_pct']:6.1f}% {r['mean_width']:8.3f} "
-                f"{r['median_width']:8.3f} {r['severity_risk']:8.4f} {r['corr_width_err']:+10.3f} "
-                f"{r['min_group_cov_pct']:6.1f}% {r['cond_cov_gap_pct']:6.1f}% "
-                f"{r['vs_crc_pct']:+8.1f}% {r['vs_compass_l_pct']:+12.1f}%"
-            )
+        delta_scp = scp_wids - our_wids  # positive = ours better
+        delta_cl  = cl_wids - our_wids
 
-    if ef_dfs:
-        print("\n--- LV EJECTION FRACTION (EF %) ---")
-        for ds, sub in df_ef.groupby("dataset", sort=False):
-            for m in ("scp_hard", "crc", "compass_l", "dacrc_ef"):
-                m_disp = display_names.get(m, m)
-                print(
-                    f"  {ds:<12} {m_disp:<12}: cov={sub[f'{m}_covered'].mean()*100:5.1f}%  "
-                    f"width={sub[f'{m}_width'].mean():6.2f} %"
-                )
+        pct_better_scp = float(np.mean(delta_scp > 0)) * 100
+        pct_better_cl  = float(np.mean(delta_cl > 0)) * 100
+        mean_improve_scp = float(np.mean(delta_scp))
+        mean_improve_cl  = float(np.mean(delta_cl))
 
-    print(f"\nAll results saved to {results_dir} (total elapsed: {time() - t0:.1f}s)", flush=True)
+        print(f"  {our_name} vs Split CP:  {pct_better_scp:.0f}% samples narrower, "
+              f"mean width diff = {mean_improve_scp:+.2f} mL")
+        print(f"  {our_name} vs COMPASS-L: {pct_better_cl:.0f}% samples narrower, "
+              f"mean width diff = {mean_improve_cl:+.2f} mL")
+
+    return valid_methods
 
 
+#  4. Plot 
+
+def plot_comparison(df: pd.DataFrame):
+    """Biểu đồ so sánh 8 methods."""
+    FIG_DIR.mkdir(parents=True, exist_ok=True)
+
+    methods = [
+        ('scp',       'Split CP',        '#E74C3C'),
+        ('crc',       'CRC',             '#3498DB'),
+        ('ascp',      'Adaptive\nSCP',   '#E67E22'),
+        ('acrc',      'Adaptive\nCRC',   '#9B59B6'),
+        ('compassl',  'COMPASS-L',       '#1ABC9C'),
+        ('compassj',  'COMPASS-J',       '#F39C12'),
+        ('crcfsl',    'CRC-FS-L\n[NEW]',     '#27AE60'),
+        ('crcfsj',    'CRC-FS-J\n[NEW]',     '#2C3E50'),
+    ]
+    methods = [(k, n, c) for k, n, c in methods if f'{k}_width' in df.columns]
+    labels = [n for _, n, _ in methods]
+    colors = [c for _, _, c in methods]
+
+    covs = [df[f'{k}_covered'].mean() * 100 for k, _, _ in methods]
+    wids = [df[f'{k}_width'].mean() for k, _, _ in methods]
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+    fig.suptitle('CRC-FS: Conformal Risk Control in Feature Space\n'
+                 f'ACDC LV Volume — 5-Fold CV — Target {(1-ALPHA)*100:.0f}% Coverage',
+                 fontsize=13, fontweight='bold')
+
+    # Coverage
+    ax1 = axes[0]
+    bars1 = ax1.bar(range(len(labels)), covs, color=colors, alpha=0.9,
+                    edgecolor='black', linewidth=0.8)
+    ax1.axhline((1-ALPHA)*100, color='red', linestyle='--', linewidth=1.5,
+                label=f'Target {(1-ALPHA)*100:.0f}%')
+    ax1.set_ylabel('Empirical Coverage (%)', fontsize=12)
+    ax1.set_ylim(min(min(covs)-5, 80), max(max(covs)+5, 100))
+    ax1.set_title('Coverage Comparison', fontsize=13, fontweight='bold')
+    ax1.set_xticks(range(len(labels)))
+    ax1.set_xticklabels(labels, fontsize=9)
+    ax1.legend(fontsize=10, loc='lower right')
+    ax1.grid(axis='y', linestyle=':', alpha=0.4)
+    for bar, val in zip(bars1, covs):
+        color = '#27AE60' if val >= (1-ALPHA)*100 else '#E74C3C'
+        ax1.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.4,
+                 f'{val:.1f}%', ha='center', va='bottom', fontsize=8,
+                 fontweight='bold', color=color)
+
+    # Width
+    ax2 = axes[1]
+    bars2 = ax2.bar(range(len(labels)), wids, color=colors, alpha=0.9,
+                    edgecolor='black', linewidth=0.8)
+    ax2.set_ylabel('Average Interval Width (mL)', fontsize=12)
+    ax2.set_title('Interval Width (Smaller = Better)', fontsize=13, fontweight='bold')
+    ax2.set_xticks(range(len(labels)))
+    ax2.set_xticklabels(labels, fontsize=9)
+    ax2.set_ylim(0, max(wids) * 1.2)
+    ax2.grid(axis='y', linestyle=':', alpha=0.4)
+    best_wid = min(wids)
+    for bar, val in zip(bars2, wids):
+        color = '#27AE60' if abs(val - best_wid) < 1e-6 else '#333333'
+        ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(wids)*0.01,
+                 f'{val:.2f}', ha='center', va='bottom', fontsize=8,
+                 fontweight='bold', color=color)
+
+    # Highlight our methods
+    for i, (key, _, _) in enumerate(methods):
+        if 'crcfs' in key:
+            for ax in axes:
+                ax.get_children()[i].set_edgecolor('#FFD700')
+                ax.get_children()[i].set_linewidth(2.5)
+
+    plt.tight_layout()
+    out_path = FIG_DIR / "crc_fs_full_comparison.png"
+    plt.savefig(str(out_path), dpi=300, bbox_inches='tight')
+    print(f"\nFigure saved -> {out_path}")
+
+    #  Extra: Width vs Coverage scatter 
+    fig2, ax = plt.subplots(figsize=(10, 7))
+
+    for key, name, color in methods:
+        cov = df[f'{key}_covered'].mean() * 100
+        wid = df[f'{key}_width'].mean()
+        size = 250 if 'crcfs' in key else 120
+        edge = '#FFD700' if 'crcfs' in key else 'black'
+        lw = 3 if 'crcfs' in key else 1
+        ax.scatter(wid, cov, c=color, s=size, edgecolors=edge, linewidth=lw,
+                   label=name, zorder=5 if 'crcfs' in key else 3)
+
+    ax.axhline((1-ALPHA)*100, color='red', linestyle='--', linewidth=1.5,
+               label=f'Target {(1-ALPHA)*100:.0f}%')
+    ax.set_xlabel('Average Width (mL) — Smaller → Better', fontsize=12)
+    ax.set_ylabel('Coverage (%) — Higher → Better', fontsize=12)
+    ax.set_title('CRC-FS: Optimal Point = Top-Left Corner\n(Best Coverage + Smallest Width)',
+                 fontsize=12, fontweight='bold')
+    ax.legend(fontsize=9, loc='upper left')
+    ax.grid(True, alpha=0.3)
+
+    # Add Pareto frontier arrow — point to best (lowest width, valid coverage)
+    best_idx = np.argmin(wids)
+    ax.annotate('BEST', xy=(wids[best_idx], covs[best_idx]),
+                xytext=(wids[best_idx] + 0.5, covs[best_idx] + 1),
+                fontsize=11, fontweight='bold', color='#27AE60',
+                arrowprops=dict(arrowstyle='->', color='#27AE60', lw=2))
+
+    plt.tight_layout()
+    out_path2 = FIG_DIR / "crc_fs_pareto.png"
+    plt.savefig(str(out_path2), dpi=300, bbox_inches='tight')
+    print(f"Figure saved -> {out_path2}")
+
+
+# Main
 if __name__ == "__main__":
-    main()
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    FIG_DIR.mkdir(parents=True, exist_ok=True)
+    # 1. Load
+    samples = load_all_samples()
+    # 2. K-Fold CV
+    df, fold_df = run_kfold(samples)
+    out_csv = RESULTS_DIR / "crc_fs_results.csv"
+    df.to_csv(str(out_csv), index=False)
+    print(f"\nCSV saved -> {out_csv}")
+    fold_csv = RESULTS_DIR / "crc_fs_fold_summary.csv"
+    fold_df.to_csv(str(fold_csv), index=False)
+    # 4. Summary
+    print_summary(df, fold_df)
+    # 5. Plot
+    plot_comparison(df)
+    print("\n Experiment complete!")

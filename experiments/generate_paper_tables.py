@@ -1,18 +1,5 @@
-"""
-experiments/generate_paper_tables.py
-
-Generate COMPASS-style (ICLR 2026) Multi-Alpha Benchmark Tables (Mean +- STD across 5 patient-level CV folds)
-for ACDC Cardiac MRI (LV, RV, MYO, and LV_EF) at alpha in {0.05, 0.10, 0.15}.
-Outputs:
-  - results/tables/paper_table_multialpha.csv
-  - results/tables/paper_table1_coverage.png
-  - results/tables/paper_table2_width.png
-  - results/tables/paper_table3_ablation.png
-"""
-
 from __future__ import annotations
 
-import argparse
 import sys
 from pathlib import Path
 from time import time
@@ -299,10 +286,6 @@ def render_academic_table_png(
     bold_mode: str = "min",
     dark_theme: bool = False,
 ) -> None:
-    """
-    Render a clean COMPASS-style publication table (booktabs aesthetic with Mean +- STD)
-    where rows_data has keys: 'dataset', 'alpha', 'vals' (dict method -> (mean, std)).
-    """
     n_rows = len(rows_data)
     n_cols = 2 + len(col_headers)
     fig_w = max(11.5, 2.2 + 1.65 * len(col_headers))
@@ -396,12 +379,12 @@ def render_academic_table_png(
                     family="DejaVu Serif",
                 )
             else:
+                is_valid = mn >= target_cov - 1e-4
                 txt = f"{mn:.3f}±{sd:.3f}"
-                is_ours = "CRC-FS" in ch
                 ax.text(
                     cx, ry, txt, ha="center", va="center", fontsize=9.2,
-                    fontweight="bold" if is_ours else "normal",
-                    color=hi_col if is_ours else sub_col,
+                    fontweight="bold" if ("CRC-FS" in ch and is_valid) else "normal",
+                    color=hi_col if ("CRC-FS" in ch and is_valid) else (("#E74C3C" if not is_valid else sub_col)),
                     family="DejaVu Serif",
                 )
 
@@ -410,144 +393,32 @@ def render_academic_table_png(
     plt.close(fig)
 
 
-def render_ablation_table_png(
-    per_sample_df: pd.DataFrame,
-    out_path: Path,
-    dark_theme: bool = True,
-) -> None:
-    """
-    Render COMPASS-style Table 3 (Feature-Space & Depth Ablation at alpha = 0.10):
-    Organ | Space / Mechanism | Method | Width (Mean+-STD) | Coverage (Mean+-STD) | Corr(W, |e|)
-    """
-    test_df = per_sample_df[per_sample_df["dataset"] == "testing_3d"]
-    spec = [
-        ("Feature-Space CRC", "32ch Jacobian + Bias", "dacrc_oof", "CRC-FS-J (Ours)"),
-        ("Feature-Space CRC", "Logit Curve + CV+", "dacrc_cv_plus", "CRC-FS-L (Ours)"),
-        ("Feature Perturb.", "Deep 32ch Head", "compass_j_32ch", "COMPASS-J (Deep 32ch)"),
-        ("Feature Perturb.", "Logit Jacobian PCA", "compass_j", "COMPASS-J (Logit)"),
-        ("Feature Perturb.", "Uniform Logit Shift", "compass_l", "COMPASS-L"),
-        ("Output-Space", "Sensitivity Norm.", "ascp_sens", "Adaptive SCP"),
-        ("Output-Space", "Theorem 2.1 Risk", "crc", "CRC (ICLR 2024)"),
-        ("Output-Space", "Quantile Residual", "scp_hard", "Split CP"),
-    ]
-
-    rows = []
-    for org, org_lbl in [("LV", "ACDC LV (mL)"), ("RV", "ACDC RV (mL)"), ("MYO", "ACDC MYO (mL)")]:
-        sub = test_df[test_df["organ"] == org]
-        w_means = []
-        org_rows = []
-        for space, mech, mkey, mlbl in spec:
-            if f"{mkey}_width" not in sub.columns:
-                continue
-            f_covs = [float(fg[f"{mkey}_covered"].mean()) for _, fg in sub.groupby("fold")]
-            f_wids = [float(fg[f"{mkey}_width"].mean()) for _, fg in sub.groupby("fold")]
-            w_all = sub[f"{mkey}_width"].values
-            e_all = sub["abs_err_hard"].values
-            corr = float(np.corrcoef(w_all, e_all)[0, 1]) if np.std(w_all) > 1e-8 else 0.0
-            wm = float(np.mean(f_wids))
-            w_means.append(wm)
-            org_rows.append({
-                "organ": org_lbl,
-                "space": space,
-                "mech": mech,
-                "method": mlbl,
-                "w_mean": wm,
-                "w_std": float(np.std(f_wids)),
-                "c_mean": float(np.mean(f_covs)),
-                "c_std": float(np.std(f_covs)),
-                "corr": corr,
-                "is_ours": mkey.startswith("dacrc"),
-            })
-        best_w = min(w_means)
-        for r in org_rows:
-            r["is_best_w"] = abs(r["w_mean"] - best_w) < 1e-6
-        rows.extend(org_rows)
-
-    n_rows = len(rows)
-    bg_col = "#1E1D1B" if dark_theme else "#FFFFFF"
-    fg_col = "#F5F3EE" if dark_theme else "#1A1A1A"
-    sub_col = "#D5D2CA" if dark_theme else "#333333"
-    rule_col = "#C8C4BA" if dark_theme else "#222222"
-    hi_col = "#2ECC71" if dark_theme else "#0E6251"
-    hi_bg = "#253028" if dark_theme else "#EAFAF1"
-
-    fig, ax = plt.subplots(figsize=(13.0, 1.5 + 0.31 * n_rows), dpi=280)
-    fig.patch.set_facecolor(bg_col)
-    ax.set_facecolor(bg_col)
-    ax.axis("off")
-
-    ax.text(0.5, 0.97, "Table 3: Feature-Space & Representation Ablation at α = 0.10 (ACDC Testing, 5-Fold Patient CV)",
-            ha="center", va="top", fontsize=11.5, fontweight="bold", color=fg_col, family="DejaVu Serif")
-
-    xs = [0.068, 0.195, 0.335, 0.490, 0.648, 0.800, 0.942]
-    hdrs = ["Organ", "Space", "Mechanism", "Method", "Width (Mean±STD ↓)", "Coverage (Mean±STD)", "Corr(W,|e|) ↑"]
-    y_top, y_hdr, y_d1, y_d2, y_bot = 0.90, 0.865, 0.835, 0.828, 0.03
-    ax.plot([0.01, 0.99], [y_top, y_top], color=rule_col, lw=1.3)
-    ax.plot([0.01, 0.99], [y_d1, y_d1], color=rule_col, lw=0.9)
-    ax.plot([0.01, 0.99], [y_d2, y_d2], color=rule_col, lw=0.9)
-    ax.plot([0.01, 0.99], [y_bot, y_bot], color=rule_col, lw=1.3)
-
-    for x, h in zip(xs, hdrs):
-        ax.text(x, y_hdr, h, ha="center", va="center", fontsize=9.2, fontweight="bold", color=fg_col, family="DejaVu Serif")
-
-    row_ys = np.linspace(y_d2 - 0.024, y_bot + 0.022, n_rows)
-    step = len(spec)
-    for i, (ry, r) in enumerate(zip(row_ys, rows)):
-        if i > 0 and i % step == 0:
-            ax.plot([0.01, 0.99], [0.5 * (row_ys[i - 1] + ry), 0.5 * (row_ys[i - 1] + ry)], color=rule_col, lw=0.7)
-        if r["is_ours"]:
-            dh = (y_d2 - y_bot) / (n_rows + 1)
-            ax.add_patch(plt.Rectangle((0.130, ry - 0.45 * dh), 0.86, 0.90 * dh, facecolor=hi_bg, alpha=0.55 if not dark_theme else 0.45, zorder=0))
-        if i % step == step // 2:
-            ax.text(xs[0], ry, r["organ"], ha="center", va="center", fontsize=9.2, fontweight="bold", color=fg_col, family="DejaVu Serif")
-        c_txt = hi_col if r["is_ours"] else sub_col
-        fw = "bold" if r["is_ours"] else "normal"
-        ax.text(xs[1], ry, r["space"], ha="center", va="center", fontsize=8.6, color=c_txt, fontweight=fw, family="DejaVu Serif")
-        ax.text(xs[2], ry, r["mech"], ha="center", va="center", fontsize=8.6, color=c_txt, fontweight=fw, family="DejaVu Serif")
-        ax.text(xs[3], ry, r["method"], ha="center", va="center", fontsize=8.8, color=c_txt, fontweight=fw, family="DejaVu Serif")
-        ax.text(xs[4], ry, f"{r['w_mean']:.2f}±{r['w_std']:.2f}", ha="center", va="center", fontsize=8.8,
-                color=hi_col if r["is_best_w"] else c_txt, fontweight="bold" if r["is_best_w"] else fw, family="DejaVu Serif")
-        ax.text(xs[5], ry, f"{r['c_mean']:.3f}±{r['c_std']:.3f}", ha="center", va="center", fontsize=8.8, color=c_txt, fontweight=fw, family="DejaVu Serif")
-        ax.text(xs[6], ry, f"{r['corr']:+.3f}", ha="center", va="center", fontsize=8.8, color=c_txt, fontweight=fw, family="DejaVu Serif")
-
-    plt.tight_layout(pad=0.2)
-    plt.savefig(str(out_path), dpi=280, bbox_inches="tight", facecolor=bg_col)
-    plt.close(fig)
-
-
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--plot-only", action="store_true")
-    args = parser.parse_args()
-
     t0 = time()
     tables_dir = WORKSPACE_DIR / "results/tables"
     fig_dir = WORKSPACE_DIR / "results/figures"
     tables_dir.mkdir(parents=True, exist_ok=True)
     fig_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.plot_only and (tables_dir / "paper_table_multialpha.csv").exists():
-        df_ma = pd.read_csv(tables_dir / "paper_table_multialpha.csv")
-    else:
-        head_w = load_head_weight("3d_fullres")
-        data_dir = WORKSPACE_DIR / "data_ACDC/testing"
-        pred_dir = WORKSPACE_DIR / "nnunet_output_testing"
+    head_w = load_head_weight("3d_fullres")
+    data_dir = WORKSPACE_DIR / "data_ACDC/testing"
+    pred_dir = WORKSPACE_DIR / "nnunet_output_testing"
 
-        all_rows = []
-        lv_samples = None
-        for org in ("LV", "RV", "MYO"):
-            cls_id = ORGAN_CLASSES[org]
-            samples = load_samples(data_dir, pred_dir, cls_id, head_weight=head_w)
-            if org == "LV":
-                lv_samples = samples
-            print(f"[Multi-Alpha] Evaluating testing_3d | {org} across alpha=(0.05, 0.10, 0.15)...", flush=True)
-            all_rows.extend(evaluate_multialpha_organ(samples, cls_id, org, "testing_3d", head_w))
+    all_rows = []
+    lv_samples = None
+    for org in ("LV", "RV", "MYO"):
+        cls_id = ORGAN_CLASSES[org]
+        samples = load_samples(data_dir, pred_dir, cls_id, head_weight=head_w)
+        if org == "LV":
+            lv_samples = samples
+        print(f"[Multi-Alpha] Evaluating testing_3d | {org} across alpha=(0.05, 0.10, 0.15)...", flush=True)
+        all_rows.extend(evaluate_multialpha_organ(samples, cls_id, org, "testing_3d", head_w))
 
-        print("[Multi-Alpha] Evaluating testing_3d | LV_EF (%) across alpha=(0.05, 0.10, 0.15)...", flush=True)
-        all_rows.extend(evaluate_multialpha_ef(lv_samples, "testing_3d"))
+    print("[Multi-Alpha] Evaluating testing_3d | LV_EF (%) across alpha=(0.05, 0.10, 0.15)...", flush=True)
+    all_rows.extend(evaluate_multialpha_ef(lv_samples, "testing_3d"))
 
-        df_ma = pd.DataFrame(all_rows)
-        df_ma.to_csv(str(tables_dir / "paper_table_multialpha.csv"), index=False)
+    df_ma = pd.DataFrame(all_rows)
+    df_ma.to_csv(str(tables_dir / "paper_table_multialpha.csv"), index=False)
 
     # Pretty display names matching the COMPASS ICLR 2026 paper tables
     disp = {
@@ -621,10 +492,6 @@ def main():
         bold_mode="min",
         dark_theme=False,
     )
-    if (tables_dir / "per_sample_results.csv").exists():
-        ps_df = pd.read_csv(tables_dir / "per_sample_results.csv")
-        render_ablation_table_png(ps_df, fig_dir / "paper_table3_ablation.png", dark_theme=True)
-        render_ablation_table_png(ps_df, tables_dir / "paper_table3_ablation_light.png", dark_theme=False)
 
     print("\n=== MULTI-ALPHA SUMMARY (testing_3d) ===")
     for org in ("LV", "RV", "MYO", "LV_EF (%)"):

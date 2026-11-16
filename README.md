@@ -1,8 +1,3 @@
-Dataset tải ở: 
-
-[ACDC](https://humanheart-project.creatis.insa-lyon.fr/database/#collection/637218c173e9f0047faa00fb)
-
-
 # Định lượng Độ tin cậy Thể tích trên Ảnh Y tế 3D bằng Conformal Risk Control trong Không gian Đặc trưng (`CRC-FS`)
 
 Hệ thống thực nghiệm và đánh giá thuật toán **CRC-FS** (`CRC-FS-L` và `CRC-FS-J`) hậu kiểm trên mô hình **3D Full-Resolution nnU-Net** cho bộ dữ liệu cộng hưởng từ tim **ACDC** (150 bệnh nhân = 300 frames 3D gồm 100 ca Training và 50 ca Unseen Testing), đối chiếu trực tiếp với `Split CP`, `CRC (ICLR 2024)`, `Adaptive SCP`, `COMPASS-L` và `COMPASS-J (ICLR 2026)`.
